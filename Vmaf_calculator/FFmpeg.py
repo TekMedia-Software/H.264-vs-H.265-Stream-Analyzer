@@ -1,0 +1,299 @@
+
+import config
+import subprocess
+import json
+import os
+import shlex
+from ffmpeg_progress_yield import FfmpegProgress
+
+
+HD_MODEL_VERSION = 'vmaf_v0.6.1'
+HD_MODEL_NAME= 'vmaf_hd'
+HD_NEG_MODEL_VERSION = 'vmaf_v0.6.1neg'
+HD_NEG_MODEL_NAME = 'vmaf_hd_neg'
+HD_PHONE_MODEL_VERSION = 'vmaf_v0.6.1'
+HD_PHONE_MODEL_NAME = 'vmaf_hd_phone'
+
+_4K_MODEL_VERSION = 'vmaf_4k_v0.6.1'
+_4K_MODEL_NAME = 'vmaf_4k'
+
+
+
+
+class FFprobe:
+    '''
+    Class to interact with FFprobe. 
+    It gets info about stream, frames and mpeg packets
+
+    Inputs:
+        - videoSrc: path to video
+    Outputs: 
+        - getStreamInfo()
+        - getFramesInfo()
+        - getPacketsInfo()
+    '''
+    cmd = os.environ.get('FFPROBE', config.ffprobe)
+
+    def __init__(self, videoSrc, loglevel="info"):
+        self.videoSrc = videoSrc
+        self.loglevel = loglevel
+        self.streamInfo = None
+        self.framesInfo = None
+        self.packetsInfo = None
+
+    ''' private methods '''
+
+    def _commit(self, opt):
+        self.cmd = f'{FFprobe.cmd} -hide_banner -loglevel {self.loglevel} -print_format json {opt} -select_streams v -i \"{self.videoSrc}\" -read_intervals %+5'
+
+    def _run(self):
+        if self.loglevel == "verbose":
+            print(self.cmd, flush=True)
+        return json.loads(subprocess.check_output(self.cmd, shell=True))
+
+    ''' public methods '''
+
+    def getStreamInfo(self):
+        self._commit('-show_streams')
+        self.streamInfo = self._run()['streams'][0]
+        return self.streamInfo
+
+    def getFramesInfo(self):
+        self._commit('-show_frames')
+        self.framesInfo = self._run()['frames']
+        return self.framesInfo
+
+    def getPacketsInfo(self):
+        self._commit('-show_packets')
+        self.packetsInfo = self._run()['packets']
+        return self.packetsInfo
+
+    def getFormatInfo(self):
+        self._commit('-show_format')
+        self.packetsInfo = self._run()['format']
+        return self.packetsInfo
+
+
+class FFmpegQos:
+    '''
+    Class to interact with FFmpeg QoS Filters: PSNR and VMAF. 
+    Particullary, it interacts with libvmaf library through lavfi filter
+    '''
+    cmd = os.environ.get('FFMPEG', config.ffmpeg)
+
+    def __init__(self,  main, ref, loglevel="info"):
+        self.loglevel = loglevel
+        self.cmd = None
+        self.main = inputFFmpeg(main, input_id=0)
+        self.ref = inputFFmpeg(ref, input_id=1)
+        self.psnrFilter = []
+        self.vmafFilter = []
+        self.invertedSrc = False
+        self.vmafpath = None
+        self.vmaf_cambi_heatmap_path = None
+
+    def _commit(self):
+        """build the final cmd to run"""
+        baseCmd = f'{FFmpegQos.cmd} -y -hide_banner -stats -loglevel {self.loglevel} '
+        inputsCmd = self._commitInputs()
+        filterCmd = self._commitFilters()
+        outputCmd = self._commitOutputs()
+        self.cmd = f'{baseCmd} {inputsCmd} {filterCmd} {outputCmd}'
+
+    def _commitInputs(self):
+        """build the cmd for the inputs files"""
+        inputCmd = f'-i \"{self.main.videoSrc}\" -i \"{self.ref.videoSrc}\" -map 0:v -map 1:v'
+        return inputCmd
+
+    def _commitOutputs(self):
+        return "-f null -"
+
+    def _commitFilters(self, filterName='lavfi'):
+        """build the cmd for the filters"""
+        filterCmd = f'-{filterName} \'{";".join(self.main.filtersList + self.ref.filtersList + self.psnrFilter + self.vmafFilter)}\''
+        return filterCmd
+
+    def getPsnr(self, stats_file=False):
+        """ 
+        It adds PSNR filter to lavfi chain and run the ffmpeg cmd.
+        The output is returned and saved as stats_file_psnr.log
+        """
+        main = self.main.lastOutputID
+        ref = self.ref.lastOutputID
+        if stats_file == True:
+            stats_file = os.path.splitext(self.main.videoSrc)[0] + '_psnr.log'
+        else:
+            stats_file = 'stats_file_psnr.log'
+
+        self.psnrFilter = [f'[{main}][{ref}]psnr=stats_file={stats_file}']
+        self._commit()
+
+        if self.loglevel == "verbose":
+            print(self.cmd, flush=True)
+        stdout = (subprocess.check_output(
+            self.cmd, stderr=subprocess.STDOUT, shell=True)).decode('utf-8')
+        stdout = stdout.split(" ")
+        psnr = [s for s in stdout if "average" in s][0].split(":")[1]
+        return float(psnr)
+
+    def getVmaf(self, log_path=None, model='HD', subsample=1, output_fmt='json', threads=0, print_progress=False, end_sync=False, features = None, cambi_heatmap = False):
+        main = self.main.lastOutputID
+        ref = self.ref.lastOutputID
+        if output_fmt == 'xml':
+            log_fmt = "xml"
+            if log_path == None:
+                log_path = os.path.splitext(self.main.videoSrc)[
+                    0] + '_vmaf.xml'
+        else:
+            log_fmt = "json"
+            if log_path == None:
+                log_path = os.path.splitext(self.main.videoSrc)[
+                    0] + '_vmaf.json'
+        self.vmafpath = log_path
+
+        self.vmaf_cambi_heatmap_path = os.path.splitext(self.main.videoSrc)[0] + '_cambi_heatmap'
+
+
+
+        if model == 'HD':
+            model_hd = f'version={HD_MODEL_VERSION}\\\\:name={HD_MODEL_NAME}|version={HD_NEG_MODEL_VERSION}\\\\:name={HD_NEG_MODEL_NAME}|version={HD_PHONE_MODEL_VERSION}\\\\:name={HD_PHONE_MODEL_NAME}\\\\:enable_transform=true'
+            model = model_hd
+        elif model == '4K':
+            model_4k = f'version={_4K_MODEL_VERSION}\\\\:name={_4K_MODEL_NAME}'
+            model = model_4k
+        if threads == 0:
+            threads = os.cpu_count()
+        if end_sync:
+            shortest = 1
+        else:
+            shortest = 0
+
+        if not features:
+            self.vmafFilter = [f'[{main}][{ref}]libvmaf=log_fmt={log_fmt}:model={model}:n_subsample={subsample}:log_path={log_path}:n_threads={threads}:shortest={shortest}']
+        
+        elif features and not cambi_heatmap:
+            self.vmafFilter = [f'[{main}][{ref}]libvmaf=log_fmt={log_fmt}:model={model}:n_subsample={subsample}:log_path={log_path}:n_threads={threads}:shortest={shortest}:feature={features}']
+
+        elif features and cambi_heatmap:
+            self.vmafFilter = [f'[{main}][{ref}]libvmaf=log_fmt={log_fmt}:model={model}:n_subsample={subsample}:log_path={log_path}:n_threads={threads}:shortest={shortest}:feature={features}\\\\:heatmaps_path={self.vmaf_cambi_heatmap_path}']
+
+
+        self._commit()
+        if self.loglevel == "verbose":
+            print(self.cmd, flush=True)
+
+        if print_progress:
+            cmd_progress = shlex.split(self.cmd)
+            process = FfmpegProgress(cmd_progress)
+            for progress in process.run_command_with_progress():
+                print(f"progress = {progress}% - ",
+                      "\n".join(str(process.stderr).splitlines()[-9:-8]),
+                      flush=True)
+
+        else:
+            process = subprocess.Popen(
+                self.cmd, stdout=subprocess.PIPE, shell=True)
+            process.communicate()
+
+        return process
+
+    def clearFilters(self):
+        self.psnrFilter = []
+        self.vmafFilter = []
+
+    def invertSrcs(self):
+        temp1 = self.main.videoSrc
+        temp2 = self.ref.videoSrc
+        invertedSrc = self.invertedSrc
+        self.__init__(temp2, temp1, self.loglevel)
+        self.invertedSrc = not (invertedSrc)
+
+
+class inputFFmpeg:
+    '''
+    Class to interact with FFmpeg inputs. 
+    It allows to manage Filter chains to each input. i.e., main and ref. Each
+    Supported Methods:
+    - setScaleFilter()
+    - setOffsetFilter()
+    - setDeintFrameFilter()
+    - setDeintFieldFilter()
+    - setTrimFilter()
+    - setFpsFilter()
+    - clearFilters()
+    '''
+
+    def __init__(self, videoSrc, input_id):
+        self.name = f'input{input_id}_'
+        self.id = input_id
+        self.videoSrc = videoSrc
+        self.filtersList = []
+        self.extraOptions = []
+        self.lastOutputID = f'{str(self.id)}:v'
+
+    def _setFilter(self, filter):
+        self.filtersList.append(filter)
+
+    def _newInOutForFilter(self):
+        self.n = len(self.filtersList)
+        if self.n == 0:
+            inputID = f'{str(self.id)}:v'
+            outputID = f'{self.name}{str(self.n)}'
+        else:
+            inputID = f'{self.name}{str(self.n-1)}'
+            outputID = f'{self.name}{str(self.n)}'
+        return inputID, outputID
+
+    def _updateOutputId(self, outputID):
+        self.lastOutputID = outputID
+
+    def setScaleFilter(self, width, height, algo='bicubic'):
+        """Filter options for Upscale or Downscale"""
+        inputID, outputID = self._newInOutForFilter()
+        scaleFilter = f'[{inputID}]scale={width}:{height}:flags={algo}[{outputID}]'
+        self._setFilter(scaleFilter)
+        self._updateOutputId(outputID)
+
+    def setOffsetFilter(self, offset):
+        """set offset for videoSrc: time to wait before display frames"""
+        inputID, outputID = self._newInOutForFilter()
+        ptsFilter = f'[{inputID}]setpts=PTS+{offset}/TB[{outputID}]'
+        self._setFilter(ptsFilter)
+        self._updateOutputId(outputID)
+
+    def setDeintFrameFilter(self):
+        """
+        Output one frame for each frame: 30i-> 30p
+        """
+        yadifOpt = '0:-1:0'
+        inputID, outputID = self._newInOutForFilter()
+        yadifFilter = f'[{inputID}]yadif={yadifOpt}[{outputID}]'
+        self._setFilter(yadifFilter)
+        self._updateOutputId(outputID)
+
+    def setDeintFieldFilter(self):
+        """
+        Output one frame for each field: 30i ->  60p
+        """
+        yadifOpt = '1:-1:0'
+        inputID, outputID = self._newInOutForFilter()
+        yadifFilter = f'[{inputID}]yadif={yadifOpt}[{outputID}]'
+        self._setFilter(yadifFilter)
+        self._updateOutputId(outputID)
+
+    def setTrimFilter(self, start, duration):
+        inputID, outputID = self._newInOutForFilter()
+        trimFilter = f'[{inputID}]trim=start={start}:duration={duration}, setpts=PTS-STARTPTS[{outputID}]'
+        self._setFilter(trimFilter)
+        self._updateOutputId(outputID)
+        return
+
+    def setFpsFilter(self, fps):
+        inputID, outputID = self._newInOutForFilter()
+        fpsFilter = f'[{inputID}]fps=fps={fps}[{outputID}]'
+        self._setFilter(fpsFilter)
+        self._updateOutputId(outputID)
+
+    def clearFilters(self):
+        self.filtersList = []
+        self.lastOutputID = f'{str(self.id)}:v'
