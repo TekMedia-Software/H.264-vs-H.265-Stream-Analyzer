@@ -76,7 +76,7 @@ We welcome contributions! Please see the CONTRIBUTING.md file for detailed guide
 
 ## License
 
-This project is licensed under a proprietary license. All rights reserved. No part of this software may be used, reproduced, modified, or distributed without prior written permission from TekMedia Software Services.
+This project is licensed under a proprietary license. All rights reserved. You may modify and use this software for personal purposes, but for any production use, reproduction, modification, or distribution, prior written permission from TekMedia Software Services is required.
 
 
 
