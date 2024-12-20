@@ -60,6 +60,12 @@ To start the application, run:
 
 The application interface will guide you through loading H.264 and H.265 video files for comparison, and provide graphical and tabulated displays of quality metrics for easy analysis.
 
+## Screenshots
+
+![Sample Screenshot 1](screenshots/1.png)
+
+![Sample Screenshot 2](screenshots/2.png)
+
 ## Contact
 
 For any questions or feedback, please reach out:
